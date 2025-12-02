@@ -18,8 +18,14 @@ class FileIntegrityMonitor:
             return {}
 
     def save_baseline(self):
-        with open(self.baseline_file, "w") as f:
-            json.dump(self.baseline, f, indent=4)
+        # Atomic Write: Write to .tmp then rename
+        tmp_file = self.baseline_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(self.baseline, f, indent=4)
+            os.replace(tmp_file, self.baseline_file)
+        except Exception as e:
+            print(f"[ERROR] Failed to save FIM baseline: {e}")
 
     def hash_file(self, path):
         try:

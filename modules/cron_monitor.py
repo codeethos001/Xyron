@@ -15,8 +15,14 @@ class CronMonitor:
         return {}
 
     def save_baseline(self):
-        with open(self.baseline_file, "w") as f:
-            json.dump(self.baseline, f, indent=4)
+        # Atomic Write
+        tmp_file = self.baseline_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(self.baseline, f, indent=4)
+            os.replace(tmp_file, self.baseline_file)
+        except Exception:
+            pass
 
     def hash_file(self, path):
         try:
@@ -33,9 +39,12 @@ class CronMonitor:
             if os.path.isfile(p):
                 current_state[p] = self.hash_file(p)
             elif os.path.isdir(p):
-                for f in os.listdir(p):
-                    fp = os.path.join(p, f)
-                    current_state[fp] = self.hash_file(fp)
+                try:
+                    for f in os.listdir(p):
+                        fp = os.path.join(p, f)
+                        current_state[fp] = self.hash_file(fp)
+                except PermissionError:
+                    pass
 
         # Compare
         for path, h in current_state.items():
@@ -47,4 +56,3 @@ class CronMonitor:
         self.baseline = current_state
         self.save_baseline()
         return alerts, []
-    

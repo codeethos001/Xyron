@@ -1,5 +1,4 @@
 import json
-import hashlib
 import os
 
 class UserMonitor:
@@ -14,8 +13,14 @@ class UserMonitor:
         return {}
 
     def save_baseline(self):
-        with open(self.baseline_file, "w") as f:
-            json.dump(self.baseline, f, indent=4)
+        # Atomic Write
+        tmp_file = self.baseline_file + ".tmp"
+        try:
+            with open(tmp_file, "w") as f:
+                json.dump(self.baseline, f, indent=4)
+            os.replace(tmp_file, self.baseline_file)
+        except Exception:
+            pass
 
     def get_users(self):
         users = set()
