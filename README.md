@@ -40,7 +40,7 @@ Designed for Linux environments, Xyron acts as a security web server for the hos
 #### Clone the Repository
 
 ```bash
-git clone [https://github.com/codeethos001/xyron.git](https://github.com/codeethos001/xyron.git)
+git clone https://github.com/codeethos001/xyron.git
 cd xyron
 ```
 
