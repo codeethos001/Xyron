@@ -1,0 +1,24 @@
+{
+    "logging": {
+        "log_file": "logs/xyron_events.log",
+        "console_output": true
+    },
+    "monitor_intervals": {
+        "process": 5,
+        "fim": 60,
+        "auth": 10,
+        "user": 60,
+        "cron": 60,
+        "ml_training": 300
+    },
+    "paths": {
+        "fim_targets": ["/etc/passwd", "/etc/shadow", "/bin/ls", "/usr/bin/ssh"],
+        "threat_list": "threatintel/bad_ips.txt",
+        "baseline_dir": "baseline"
+    },
+    "thresholds": {
+        "cpu_usage": 80,
+        "memory_usage": 80,
+        "max_login_failures": 5
+    }
+}

@@ -1,104 +1,77 @@
 from scapy.all import sniff, IP, TCP, UDP, ICMP
 import time
-from modules.threat_intel import threatintel
+from modules.threat_intel import ThreatIntel
 
-SUSPICIOUS_PORTS = {4444, 31337, 5555, 1337}
+SUSPICIOUS_PORTS = {4444, 31337, 5555, 1337, 6667}
 
 class NetworkMonitor:
-    def __init__(self):
+    def __init__(self, config, alert_manager):
+        self.alert_manager = alert_manager
+        self.threat_intel = ThreatIntel(config)
         self.counters = {}    # ip -> {syn:0, packets:0, icmp:0, dns:0}
         self.last_cleanup = time.time()
 
     def _init_ip(self, ip):
         if ip not in self.counters:
-            self.counters[ip] = {
-                "packets": 0,
-                "syn": 0,
-                "icmp": 0,
-                "dns": 0,
-            }
+            self.counters[ip] = {"packets": 0, "syn": 0, "icmp": 0, "dns": 0}
 
     def cleanup(self):
-        """Reset counters every 10 seconds to avoid memory growth."""
+        """Reset counters every 10 seconds."""
         now = time.time()
         if now - self.last_cleanup >= 10:
             self.counters = {}
             self.last_cleanup = now
 
     def packet_handler(self, pkt):
-        alerts = []
-
-        # We only care about packets with an IP header
+        self.cleanup()
+        
         if not pkt.haslayer(IP):
-            return alerts
+            return
 
         src = pkt[IP].src
+        dst = pkt[IP].dst
+        
+        # Threat Intel Check
+        if self.threat_intel.check_ip(src):
+            self.alert_manager.log_alert("NET", "CRITICAL", f"Inbound Traffic from Malicious IP: {src}")
+        if self.threat_intel.check_ip(dst):
+            self.alert_manager.log_alert("NET", "CRITICAL", f"Outbound Connection to Malicious IP: {dst}")
+
         self._init_ip(src)
         self.counters[src]["packets"] += 1
 
-#       -----------------------------
-#       Detect Large Packet
-#       -----------------------------
+        # 1. Large Packet Detection
         if len(pkt) > 1500:
-            alerts.append(f"[NET] LARGE_PACKET {src} size={len(pkt)}")
+            self.alert_manager.log_alert("NET", "LOW", f"Large Packet from {src} size={len(pkt)}")
 
-#       -----------------------------
-#       Detect TCP scans
-#       -----------------------------
+        # 2. TCP Analysis
         if pkt.haslayer(TCP):
             flags = pkt[TCP].flags
+            dport = pkt[TCP].dport
 
-            # SYN scan: many SYN packets without ACKs
+            # SYN Scan Logic
             if flags == "S":
                 self.counters[src]["syn"] += 1
                 if self.counters[src]["syn"] >= 20:
-                    alerts.append(f"[NET] Possible SYN Scan from {src}")
+                    self.alert_manager.log_alert("NET", "HIGH", f"Possible SYN Scan from {src}")
+                    self.counters[src]["syn"] = 0 # Reset to avoid spam
 
-            # NULL Scan
+            # Bad Flags
             if flags == 0:
-                alerts.append(f"[NET] NULL Scan packet from {src}")
+                self.alert_manager.log_alert("NET", "MEDIUM", f"NULL Scan packet from {src}")
+            if flags == 0x29: # FPU (XMAS)
+                self.alert_manager.log_alert("NET", "MEDIUM", f"XMAS Scan packet from {src}")
 
-            # FIN Scan
-            if flags == "F":
-                alerts.append(f"[NET] FIN Scan packet from {src}")
-
-            # XMAS scan = FIN + PSH + URG flags
-            if flags == "FPU":
-                alerts.append(f"[NET] XMAS Scan packet from {src}")
-
-            # Suspicious ports
-            dport = pkt[TCP].dport
             if dport in SUSPICIOUS_PORTS:
-                alerts.append(f"[NET] Suspicious port {dport} accessed by {src}")
+                self.alert_manager.log_alert("NET", "HIGH", f"Suspicious port {dport} accessed by {src}")
 
-#       -----------------------------
-#       ICMP Flood
-#       -----------------------------
-        if pkt.haslayer(ICMP):
-            icmp_type = pkt[ICMP].type
-            if icmp_type == 8:  # echo request
-                self.counters[src]["icmp"] += 1
-                if self.counters[src]["icmp"] >= 30:
-                    alerts.append(f"[NET] Possible ICMP Flood from {src}")
-
-#       -----------------------------
-#       DNS Flood
-#       -----------------------------
-        if pkt.haslayer(UDP) and pkt[UDP].dport == 53:
-            self.counters[src]["dns"] += 1
-            if self.counters[src]["dns"] >= 40:
-                alerts.append(f"[NET] Possible DNS Flood from {src}")
-
-        alerts = net_monitor.packet_handler(pkt)
-        for alert in alerts:
-            ip = extract_ip_from_alert(alert)
-            if threatintel.check_ip(ip):
-                print(f"[THREAT INTEL] {ip} is in blacklist! Known malicious source.")
-
-
-        return alerts
+        # 3. ICMP Flood
+        if pkt.haslayer(ICMP) and pkt[ICMP].type == 8:
+            self.counters[src]["icmp"] += 1
+            if self.counters[src]["icmp"] >= 30:
+                self.alert_manager.log_alert("NET", "MEDIUM", f"Possible ICMP Flood from {src}")
+                self.counters[src]["icmp"] = 0
 
     def start(self):
-        """Start packet sniffing using Scapy."""
-        print("[+] Network monitor is running...")
-        sniff(prn=self.packet_handler, store=False)
+        # Store=False prevents memory leaks from keeping packets in RAM
+        sniff(prn=self.packet_handler, store=False) 
