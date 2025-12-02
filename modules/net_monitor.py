@@ -1,77 +1,133 @@
-from scapy.all import sniff, IP, TCP, UDP, ICMP
+from scapy.all import sniff, IP, TCP, UDP, ICMP, ARP, Raw
 import time
 from modules.threat_intel import ThreatIntel
-
-SUSPICIOUS_PORTS = {4444, 31337, 5555, 1337, 6667}
 
 class NetworkMonitor:
     def __init__(self, config, alert_manager):
         self.alert_manager = alert_manager
         self.threat_intel = ThreatIntel(config)
-        self.counters = {}    # ip -> {syn:0, packets:0, icmp:0, dns:0}
+        
+        # grab config stuff
+        self.whitelist = set(config.get("network", {}).get("whitelist", ["127.0.0.1", "0.0.0.0"]))
+        self.cooldown_time = config.get("network", {}).get("alert_cooldown", 60)
+        self.syn_threshold = config.get("network", {}).get("syn_threshold", 15)
+        
+        # tracking vars
+        self.traffic_stats = {} 
+        self.alert_history = {}
+        
+        # keep track of mac addresses to spot spoofing
+        self.arp_table = {} 
+        
         self.last_cleanup = time.time()
 
-    def _init_ip(self, ip):
-        if ip not in self.counters:
-            self.counters[ip] = {"packets": 0, "syn": 0, "icmp": 0, "dns": 0}
+    def _should_alert(self, ip, alert_type):
+        """
+        check if we need to yell or if we just yelled recently.
+        returns True if we should alert.
+        """
+        key = (ip, alert_type)
+        now = time.time()
+        last_alert = self.alert_history.get(key, 0)
+        
+        if now - last_alert < self.cooldown_time:
+            return False
+            
+        self.alert_history[key] = now
+        return True
 
-    def cleanup(self):
-        """Reset counters every 10 seconds."""
+    def _cleanup(self):
+        # clean up stats every 10s so we don't hoard memory
         now = time.time()
         if now - self.last_cleanup >= 10:
-            self.counters = {}
+            self.traffic_stats = {}
             self.last_cleanup = now
 
     def packet_handler(self, pkt):
-        self.cleanup()
+        self._cleanup()
         
+        # --- ARP Spoofing Check (Local Network Attacks) ---
+        if pkt.haslayer(ARP) and pkt[ARP].op == 2: # is-at reply
+            src_ip = pkt[ARP].psrc
+            src_mac = pkt[ARP].hwsrc
+            
+            if src_ip in self.arp_table:
+                # if the mac changed for the same IP, someone is likely messing around
+                if self.arp_table[src_ip] != src_mac:
+                    if self._should_alert(src_ip, "ARP_SPOOF"):
+                        self.alert_manager.log_alert("NET", "CRITICAL", f"ARP Spoofing! IP {src_ip} mac changed from {self.arp_table[src_ip]} to {src_mac}")
+            
+            # update the table
+            self.arp_table[src_ip] = src_mac
+
         if not pkt.haslayer(IP):
             return
 
         src = pkt[IP].src
         dst = pkt[IP].dst
         
-        # Threat Intel Check
+        # --- Noise Filtering ---
+        # ignore local stuff or broadcast noise
+        if src in self.whitelist or dst in self.whitelist: return
+        if dst == "255.255.255.255" or dst.startswith("224.") or dst.startswith("239."): return
+
+        # --- Threat Intel ---
         if self.threat_intel.check_ip(src):
-            self.alert_manager.log_alert("NET", "CRITICAL", f"Inbound Traffic from Malicious IP: {src}")
-        if self.threat_intel.check_ip(dst):
-            self.alert_manager.log_alert("NET", "CRITICAL", f"Outbound Connection to Malicious IP: {dst}")
+            if self._should_alert(src, "MALICIOUS_IP"):
+                self.alert_manager.log_alert("NET", "CRITICAL", f"Traffic from known bad IP: {src}")
 
-        self._init_ip(src)
-        self.counters[src]["packets"] += 1
+        # init stats for new guys
+        if src not in self.traffic_stats:
+            self.traffic_stats[src] = {"syn_ports": set(), "icmp": 0}
 
-        # 1. Large Packet Detection
-        if len(pkt) > 1500:
-            self.alert_manager.log_alert("NET", "LOW", f"Large Packet from {src} size={len(pkt)}")
-
-        # 2. TCP Analysis
+        # --- TCP Analysis ---
         if pkt.haslayer(TCP):
             flags = pkt[TCP].flags
             dport = pkt[TCP].dport
 
+            # Payload Inspection (Web Attack Signatures)
+            # looking for obvious stuff like shell injection or SQLi in the packet text
+            if pkt.haslayer(Raw):
+                try:
+                    payload = str(pkt[Raw].load).lower()
+                    # simplistic keywords but effective for basic scripts
+                    bad_keywords = ["union select", "/etc/passwd", "eval(", "<script>", "cmd.exe", "bash -i"]
+                    for bad in bad_keywords:
+                        if bad in payload:
+                            if self._should_alert(src, "PAYLOAD_ATTACK"):
+                                self.alert_manager.log_alert("NET", "CRITICAL", f"Payload Attack from {src}: found '{bad}'")
+                except:
+                    pass # ignore binary data
+
             # SYN Scan Logic
+            # if they are hitting too many unique ports, they are mapping us
             if flags == "S":
-                self.counters[src]["syn"] += 1
-                if self.counters[src]["syn"] >= 20:
-                    self.alert_manager.log_alert("NET", "HIGH", f"Possible SYN Scan from {src}")
-                    self.counters[src]["syn"] = 0 # Reset to avoid spam
+                self.traffic_stats[src]["syn_ports"].add(dport)
+                unique_ports = len(self.traffic_stats[src]["syn_ports"])
+                
+                if unique_ports >= self.syn_threshold:
+                    if self._should_alert(src, "SYN_SCAN"):
+                        self.alert_manager.log_alert("NET", "HIGH", f"SYN Scan from {src} (hit {unique_ports} ports)")
 
-            # Bad Flags
+            # Weird Flags (Null, Xmas)
+            # modern os don't usually send these, so its prob a scanner
             if flags == 0:
-                self.alert_manager.log_alert("NET", "MEDIUM", f"NULL Scan packet from {src}")
+                if self._should_alert(src, "NULL_SCAN"):
+                    self.alert_manager.log_alert("NET", "MEDIUM", f"NULL Scan from {src}")
+            
             if flags == 0x29: # FPU (XMAS)
-                self.alert_manager.log_alert("NET", "MEDIUM", f"XMAS Scan packet from {src}")
+                if self._should_alert(src, "XMAS_SCAN"):
+                    self.alert_manager.log_alert("NET", "MEDIUM", f"XMAS Scan from {src}")
 
-            if dport in SUSPICIOUS_PORTS:
-                self.alert_manager.log_alert("NET", "HIGH", f"Suspicious port {dport} accessed by {src}")
-
-        # 3. ICMP Flood
-        if pkt.haslayer(ICMP) and pkt[ICMP].type == 8:
-            self.counters[src]["icmp"] += 1
-            if self.counters[src]["icmp"] >= 30:
-                self.alert_manager.log_alert("NET", "MEDIUM", f"Possible ICMP Flood from {src}")
-                self.counters[src]["icmp"] = 0
+        # --- ICMP Analysis ---
+        if pkt.haslayer(ICMP):
+            # only care about ping requests (type 8)
+            if pkt[ICMP].type == 8:
+                self.traffic_stats[src]["icmp"] += 1
+                if self.traffic_stats[src]["icmp"] >= 30:
+                    if self._should_alert(src, "ICMP_FLOOD"):
+                        self.alert_manager.log_alert("NET", "MEDIUM", f"ICMP Flood incoming from {src}")
 
     def start(self):
-        # Store=False prevents memory leaks from keeping packets in RAM
-        sniff(prn=self.packet_handler, store=False) 
+        # store=False is key so we don't eat all the ram
+        sniff(prn=self.packet_handler, store=False)
